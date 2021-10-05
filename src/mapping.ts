@@ -1,88 +1,110 @@
-import { BigInt } from "@graphprotocol/graph-ts"
-import {
-  OpenSea,
-  OrderApprovedPartOne,
-  OrderApprovedPartTwo,
-  OrderCancelled,
-  OrdersMatched,
-  OwnershipRenounced,
-  OwnershipTransferred
-} from "../generated/OpenSea/OpenSea"
-import { ExampleEntity } from "../generated/schema"
+import { Address, log } from "@graphprotocol/graph-ts"
+import { AtomicMatch_Call } from "../generated/OpenSea/OpenSea"
+import { ERC721, Transfer} from "../generated/templates/ERC721/ERC721"
+import { Token, Contract, TransferEvent } from "../generated/schema"
+import { ERC721 as ERC721Registry } from "../generated/templates"
+const WHITE_LIST_CONTRACTS_ADDRS:Array<string> = ["0x57f1887a8BF19b14fC0dF6Fd9B2acc9Af147eA85"]
+const WHITE_LIST_CONTRACTS_NAMES:Array<string> = ["Ethereum Name Service"]
 
-export function handleOrderApprovedPartOne(event: OrderApprovedPartOne): void {
-  // Entities can be loaded from the store using a string ID; this ID
-  // needs to be unique across all entities of the same type
-  let entity = ExampleEntity.load(event.transaction.from.toHex())
+let non_721_tokens:Array<string> = []
 
-  // Entities only exist after they have been saved to the store;
-  // `null` checks allow to create entities on demand
-  if (!entity) {
-    entity = new ExampleEntity(event.transaction.from.toHex())
-
-    // Entity fields can be set using simple assignments
-    entity.count = BigInt.fromI32(0)
+function createContractIfNotExisted(addr:string): void{
+  if(non_721_tokens.includes(addr)){
+    return
   }
-
-  // BigInt and BigDecimal math are supported
-  entity.count = entity.count + BigInt.fromI32(1)
-
-  // Entity fields can be set based on event parameters
-  entity.hash = event.params.hash
-  entity.exchange = event.params.exchange
-
-  // Entities can be written to the store with `.save()`
-  entity.save()
-
-  // Note: If a handler doesn't require existing field values, it is faster
-  // _not_ to load the entity from the store. Instead, create it fresh with
-  // `new Entity(...)`, set the fields that should be updated and save the
-  // entity back to the store. Fields that were not set or unset remain
-  // unchanged, allowing for partial updates to be applied.
-
-  // It is also possible to access smart contracts from mappings. For
-  // example, the contract that has emitted the event can be connected to
-  // with:
-  //
-  // let contract = Contract.bind(event.address)
-  //
-  // The following functions can then be called on this contract to access
-  // state variables and other data:
-  //
-  // - contract.name(...)
-  // - contract.tokenTransferProxy(...)
-  // - contract.staticCall(...)
-  // - contract.guardedArrayReplace(...)
-  // - contract.minimumTakerProtocolFee(...)
-  // - contract.codename(...)
-  // - contract.testCopyAddress(...)
-  // - contract.testCopy(...)
-  // - contract.calculateCurrentPrice_(...)
-  // - contract.version(...)
-  // - contract.orderCalldataCanMatch(...)
-  // - contract.validateOrder_(...)
-  // - contract.calculateFinalPrice(...)
-  // - contract.protocolFeeRecipient(...)
-  // - contract.hashOrder_(...)
-  // - contract.ordersCanMatch_(...)
-  // - contract.registry(...)
-  // - contract.minimumMakerProtocolFee(...)
-  // - contract.hashToSign_(...)
-  // - contract.cancelledOrFinalized(...)
-  // - contract.owner(...)
-  // - contract.exchangeToken(...)
-  // - contract.validateOrderParameters_(...)
-  // - contract.INVERSE_BASIS_POINT(...)
-  // - contract.calculateMatchPrice_(...)
-  // - contract.approvedOrders(...)
+  let contract = Contract.load(addr)
+  if(!contract){
+    let contractName: string | null = null
+    let position = WHITE_LIST_CONTRACTS_ADDRS.indexOf(addr)
+    if(position >= 0){
+      contractName = WHITE_LIST_CONTRACTS_NAMES[position]
+    }
+    if(contractName == null){
+      let nftContract = ERC721.bind(Address.fromString(addr))
+      log.debug("contract created "+addr,[])
+      if(nftContract.try_symbol().reverted){
+        log.debug("try_symbol reverted "+addr,[])
+        non_721_tokens.push(addr)
+        return
+      }
+      let callResult = nftContract.try_name()
+      if(callResult.reverted){
+        log.debug("try_name reverted "+addr,[])
+        non_721_tokens.push(addr)
+        return
+      }
+      contractName = callResult.value
+    }
+    contract = new Contract(addr)
+    contract.name = (contractName || '') as string
+    contract.address = Address.fromString(addr)
+    contract.tokens = []
+    contract.save()
+    ERC721Registry.create(Address.fromString(addr))
+  }
+}
+export function handleOpenSeaSale(call:AtomicMatch_Call): void{
+  let addrs = call.inputs.addrs
+  createContractIfNotExisted(addrs[4].toHexString())
 }
 
-export function handleOrderApprovedPartTwo(event: OrderApprovedPartTwo): void {}
+export function handleTransfer(event: Transfer): void {
+  let contract = Contract.load(event.address.toHexString())
 
-export function handleOrderCancelled(event: OrderCancelled): void {}
+  let nftContract = ERC721.bind(Address.fromString(event.address.toHexString()))
 
-export function handleOrdersMatched(event: OrdersMatched): void {}
+  let shouldSaveContract = false
+  if(!contract){
+    contract = new Contract(event.address.toHexString())
+    contract.address = event.address
 
-export function handleOwnershipRenounced(event: OwnershipRenounced): void {}
+    let callResult = nftContract.try_name()
+    if(callResult.value == null){
+      return
+    }
+    else{
+      contract.name = callResult.value
+      shouldSaveContract = true
+    }
+  }
+  let tokenId = contract.address.toHexString() + '_'+event.params.tokenId.toString()
+  let token = Token.load(tokenId)
+  if(!token){
+    token = new Token(tokenId)
+    token.tokenId = event.params.tokenId
+    token.contract = contract.id
+    
+    let tks = contract.tokens
+    tks.push(token.id)
+    contract.tokens = tks
+    shouldSaveContract = true
+  }
 
-export function handleOwnershipTransferred(event: OwnershipTransferred): void {}
+  let callOwner = nftContract.try_ownerOf(event.params.tokenId)
+  if(!callOwner.reverted){
+    token.owner = callOwner.value
+  }
+  token.save()
+    
+  if(shouldSaveContract){
+    contract.save()
+  }
+  
+  let transferId = event.transaction.hash.toHexString()+' '+event.logIndex.toString()
+  let transfer = TransferEvent.load(transferId)
+  if(!transfer){
+    transfer = new TransferEvent(transferId)
+    transfer.contract = contract.id
+    transfer.contractAddress = event.address
+    transfer.token = token.id
+    transfer.tokenId = event.params.tokenId
+    transfer.txEth = event.transaction.value.toBigDecimal()
+    transfer.from = event.params.from
+    transfer.to = event.params.from
+    transfer.block = event.block.number
+    transfer.timestamp = event.block.timestamp
+    transfer.logIndex = event.logIndex
+    transfer.txHash = event.transaction.hash
+    transfer.save()
+  }
+}
